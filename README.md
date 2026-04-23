@@ -209,6 +209,49 @@ To increase speed, deploy `Code.gs` multiple times to different Apps Script proj
 }
 ```
 
+`script_ids` are used in round-robin order. That can improve throughput and spread burst traffic, but it does **not** automatically increase your daily quota if those deployments all run under the same Google account. Apps Script quotas are primarily per user, so you only gain extra daily budget when traffic is spread across different Google users/accounts with separate quota pools.
+
+### Apps Script Quotas and Limits
+
+Google Apps Script quotas are per user and reset 24 hours after the first request, not at midnight. They can also change without notice.
+
+For this project, the most important limits from the Google Apps Script quotas page are:
+
+| Limit | Consumer account | Google Workspace |
+|------|------------------|------------------|
+| URL Fetch calls | 20,000 / day | 100,000 / day |
+| Script runtime | 6 min / execution | 6 min / execution |
+| Simultaneous executions per user | 30 | 30 |
+| Simultaneous executions per script | 1,000 | 1,000 |
+| Properties read/write | 50,000 / day | 500,000 / day |
+| URL Fetch response size | 50 MB / call | 50 MB / call |
+| URL Fetch POST size | 50 MB / call | 50 MB / call |
+| URL Fetch headers | 100 / call | 100 / call |
+| URL Fetch header size | 8 KB / call | 8 KB / call |
+| URL Fetch URL length | 2 KB / call | 2 KB / call |
+| Triggers total runtime | 90 min / day | 6 hr / day |
+
+How that maps to this relay:
+
+- Every Apps Script fetch done by `Code.gs` counts against your daily `URL Fetch calls` quota.
+- Batch mode is faster, but each item inside `fetchAll()` still consumes fetch quota.
+- The local soft guard in `Code.gs` defaults to `18,000` fetches per rolling 24-hour window so consumer accounts hit a controlled app-level limit before Google's hard `20,000/day` limit.
+- Quota tracking in `Code.gs` uses `PropertiesService`, so its reads/writes also count against the `Properties read/write` quota.
+- The proxy also spends some quota on itself: startup prewarm plus the keepalive ping every 240 seconds can consume about 360 extra fetch calls/day while the proxy stays idle but running.
+- Large downloads still must fit Apps Script limits; a single fetch response or POST body over `50 MB` will fail.
+- If too many requests arrive at once, Apps Script may fail with simultaneous execution or short-burst throttling errors even before the daily quota is exhausted.
+- Parallel download mode is quota-expensive: large files are split into `256 KB` range fetches, and each chunk is a separate Apps Script call. A `10 MB` file is roughly 40 fetch calls before retries.
+- `Code.gs` tracks that soft limit as a rolling 24-hour window anchored to the first counted request in the current window, which matches the Google quota documentation more closely than a calendar-day reset.
+
+Recommended settings for quota-sensitive use:
+
+- Keep `low_quota_mode: true` in `config.json`.
+- Keep `disable_parallel_downloads: true` unless you intentionally want faster large downloads in exchange for higher quota burn.
+- Use `blocked_hosts` to drop trackers and telemetry that waste fetch calls.
+- `low_quota_mode` also enables short local caching (`HTML`, `JSON`, and static assets) and drops selected YouTube telemetry requests locally; this reduces quota usage but can serve slightly stale content for a short time and skips non-essential analytics/QoE calls.
+- Use `script_ids` only when you have multiple deployments/accounts and understand the quota cost still applies per deployment user.
+- Expect `502 Bad JSON`, `quota_soft_limit`, or `quota_hard_limit` errors when Apps Script starts returning quota pages or exceptions.
+
 ---
 
 ## Updating the Google Relay
@@ -273,6 +316,7 @@ python main.py --no-cert-check          # Skip automatic CA install check on sta
 | Connection timeout | Try a different `google_ip` or check your internet connection |
 | Slow browsing | Deploy multiple `Code.gs` copies and use `script_ids` array for load balancing |
 | `502 Bad JSON` error | Google returned an unexpected response (HTML instead of JSON). Causes: wrong `script_id`, Apps Script daily quota exhausted, or the deployment wasn't re-created after editing `Code.gs`. Check your `script_id` and create a **new deployment** if you recently changed `Code.gs`. |
+| `quota_soft_limit` / `quota_hard_limit` | You hit the relay's soft guard or Google's own Apps Script limit. Wait for the quota window to reset, reduce traffic, keep `low_quota_mode` enabled, or spread traffic across additional deployments/accounts. |
 
 ---
 

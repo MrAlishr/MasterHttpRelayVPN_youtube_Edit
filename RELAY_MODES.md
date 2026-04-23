@@ -152,9 +152,16 @@ You send your request to Google Apps Script, and Google fetches the website for 
 ✅ Can handle multiple requests at once (fast!)
 
 **Bad stuff:**
-❌ Google has daily limits (usually enough for personal use)
+❌ Google has daily limits (`URL Fetch calls`: commonly `20,000/day` on consumer accounts and `100,000/day` on Workspace)
 ❌ Slightly slower (extra hop through Google)
 ❌ Requires a Google account
+
+**Important Apps Script limits for this mode:**
+- `6 min` max runtime per execution
+- `50 MB` max response size per `UrlFetchApp` call
+- `50 MB` max POST body size
+- `30` simultaneous executions per user
+- quotas reset `24 hours after the first request`
 
 ---
 

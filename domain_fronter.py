@@ -26,7 +26,7 @@ import os
 import re
 import ssl
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
 from ws import ws_encode, ws_decode
 
@@ -528,6 +528,104 @@ class DomainFronter:
 
         return await self._batch_submit(payload)
 
+    async def fetch_quota_status(self) -> dict:
+        """Fetch live Apps Script quota JSON for the configured relay."""
+        if self.mode != "apps_script":
+            raise RuntimeError("Quota status is only available in apps_script mode")
+        if not self.auth_key:
+            raise RuntimeError("Missing auth_key for Apps Script quota request")
+
+        query = urlencode({"k": self.auth_key})
+        path = f"{self._exec_path()}?{query}"
+
+        if self._h2 and self._h2.is_connected:
+            status, _, body = await asyncio.wait_for(
+                self._h2.request(
+                    method="GET",
+                    path=path,
+                    host=self.http_host,
+                    headers=None,
+                    body=None,
+                ),
+                timeout=25,
+            )
+            if status == 404 and self._dev_available:
+                # Some deployments expose /exec only; recover automatically.
+                self._dev_available = False
+                path = f"{self._exec_path()}?{query}"
+                status, _, body = await asyncio.wait_for(
+                    self._h2.request(
+                        method="GET",
+                        path=path,
+                        host=self.http_host,
+                        headers=None,
+                        body=None,
+                    ),
+                    timeout=25,
+                )
+            if status >= 400:
+                raise RuntimeError(f"Quota request failed with status {status}")
+            return self._decode_json_object(body)
+
+        reader, writer, created = await self._acquire()
+        try:
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {self.http_host}\r\n"
+                f"Accept-Encoding: gzip\r\n"
+                f"Connection: keep-alive\r\n"
+                f"\r\n"
+            )
+            writer.write(request.encode())
+            await writer.drain()
+
+            status, resp_headers, resp_body = await self._read_http_response(reader)
+            if status == 404 and self._dev_available:
+                # Auto-fallback from /dev to /exec for quota endpoint.
+                self._dev_available = False
+                path = f"{self._exec_path()}?{query}"
+                request = (
+                    f"GET {path} HTTP/1.1\r\n"
+                    f"Host: {self.http_host}\r\n"
+                    f"Accept-Encoding: gzip\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                )
+                writer.write(request.encode())
+                await writer.drain()
+                status, resp_headers, resp_body = await self._read_http_response(reader)
+
+            for _ in range(5):
+                if status not in (301, 302, 303, 307, 308):
+                    break
+                location = resp_headers.get("location")
+                if not location:
+                    break
+                parsed = urlparse(location)
+                rpath = parsed.path + ("?" + parsed.query if parsed.query else "")
+                request = (
+                    f"GET {rpath} HTTP/1.1\r\n"
+                    f"Host: {parsed.netloc}\r\n"
+                    f"Accept-Encoding: gzip\r\n"
+                    f"Connection: keep-alive\r\n"
+                    f"\r\n"
+                )
+                writer.write(request.encode())
+                await writer.drain()
+                status, resp_headers, resp_body = await self._read_http_response(reader)
+
+            await self._release(reader, writer, created)
+
+            if status >= 400:
+                raise RuntimeError(f"Quota request failed with status {status}")
+            return self._decode_json_object(resp_body)
+        except Exception:
+            try:
+                writer.close()
+            except Exception:
+                pass
+            raise
+
     async def _coalesced_submit(self, url: str, payload: dict) -> bytes:
         """Dedup concurrent requests for the same URL (no Range header)."""
         if url in self._coalesce:
@@ -1008,13 +1106,9 @@ class DomainFronter:
     def _parse_batch_body(self, resp_body: bytes,
                           payloads: list[dict]) -> list[bytes]:
         """Parse a batch response body into individual results."""
-        text = resp_body.decode(errors="replace").strip()
-        try:
-            data = json.loads(text)
-        except json.JSONDecodeError:
-            m = re.search(r'\{.*\}', text, re.DOTALL)
-            data = json.loads(m.group()) if m else None
+        data = self._decode_json_object(resp_body, allow_none=True)
         if not data:
+            text = resp_body.decode(errors="replace").strip()
             raise RuntimeError(f"Bad batch response: {text[:200]}")
 
         if "e" in data:
@@ -1132,28 +1226,57 @@ class DomainFronter:
 
     def _parse_relay_response(self, body: bytes) -> bytes:
         """Parse JSON from Apps Script and reconstruct an HTTP response."""
+        if not body.strip():
+            return self._error_response(502, "Empty response from relay")
+        try:
+            data = self._decode_json_object(body)
+        except RuntimeError as exc:
+            return self._error_response(502, str(exc))
+
+        return self._parse_relay_json(data)
+
+    @staticmethod
+    def _decode_json_object(body: bytes, allow_none: bool = False) -> dict | None:
+        """Decode a JSON object, tolerating wrapped noise around the payload."""
         text = body.decode(errors="replace").strip()
         if not text:
-            return self._error_response(502, "Empty response from relay")
+            return None if allow_none else {}
 
         try:
             data = json.loads(text)
         except json.JSONDecodeError:
-            m = re.search(r'\{.*\}', text, re.DOTALL)
-            if m:
-                try:
-                    data = json.loads(m.group())
-                except json.JSONDecodeError:
-                    return self._error_response(502, f"Bad JSON: {text[:200]}")
-            else:
-                return self._error_response(502, f"No JSON: {text[:200]}")
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if not match:
+                if allow_none:
+                    return None
+                raise RuntimeError(f"No JSON: {text[:200]}")
+            try:
+                data = json.loads(match.group())
+            except json.JSONDecodeError as exc:
+                if allow_none:
+                    return None
+                raise RuntimeError(f"Bad JSON: {text[:200]}") from exc
 
-        return self._parse_relay_json(data)
+        if isinstance(data, dict):
+            return data
+        if allow_none:
+            return None
+        raise RuntimeError("Unexpected JSON payload type")
 
     def _parse_relay_json(self, data: dict) -> bytes:
         """Convert a parsed relay JSON dict to raw HTTP response bytes."""
         if "e" in data:
-            return self._error_response(502, f"Relay error: {data['e']}")
+            relay_error = str(data.get("e", "relay_error"))
+            quota = data.get("quota")
+            if relay_error in ("quota_soft_limit", "quota_hard_limit"):
+                details = f"Relay quota limit reached ({relay_error})"
+                if isinstance(quota, dict):
+                    used = quota.get("used")
+                    limit = quota.get("limit")
+                    remaining = quota.get("remaining")
+                    details += f"; used={used}, limit={limit}, remaining={remaining}"
+                return self._error_response(429, details)
+            return self._error_response(502, f"Relay error: {relay_error}")
 
         status = data.get("s", 200)
         resp_headers = data.get("h", {})

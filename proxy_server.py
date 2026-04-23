@@ -10,10 +10,12 @@ Supports:
 """
 
 import asyncio
+import json
 import logging
 import re
 import ssl
 import time
+from urllib.parse import urlparse
 
 from domain_fronter import DomainFronter
 
@@ -59,7 +61,14 @@ class ResponseCache:
         self._size += size
 
     @staticmethod
-    def parse_ttl(raw_response: bytes, url: str) -> int:
+    def parse_ttl(
+        raw_response: bytes,
+        url: str,
+        html_ttl: int = 0,
+        json_ttl: int = 0,
+        static_min_ttl: int = 0,
+        max_ttl: int = 86400,
+    ) -> int:
         """Determine cache TTL from response headers and URL."""
         hdr_end = raw_response.find(b"\r\n\r\n")
         if hdr_end < 0:
@@ -75,7 +84,7 @@ class ResponseCache:
         # Explicit max-age
         m = re.search(r"max-age=(\d+)", hdr)
         if m:
-            return min(int(m.group(1)), 86400)
+            return min(int(m.group(1)), max_ttl)
 
         # Heuristic by content type / extension
         path = url.split("?")[0].lower()
@@ -86,21 +95,44 @@ class ResponseCache:
         )
         for ext in static_exts:
             if path.endswith(ext):
-                return 3600  # 1 hour for static assets
+                ttl = 3600  # 1 hour default for static assets
+                if static_min_ttl > ttl:
+                    ttl = static_min_ttl
+                return min(ttl, max_ttl)
 
         ct_m = re.search(r"content-type:\s*([^\r\n]+)", hdr)
         ct = ct_m.group(1) if ct_m else ""
         if "image/" in ct or "font/" in ct:
-            return 3600
+            ttl = 3600
+            if static_min_ttl > ttl:
+                ttl = static_min_ttl
+            return min(ttl, max_ttl)
         if "text/css" in ct or "javascript" in ct:
-            return 1800
+            ttl = 1800
+            if static_min_ttl > ttl:
+                ttl = static_min_ttl
+            return min(ttl, max_ttl)
         if "text/html" in ct or "application/json" in ct:
-            return 0  # don't cache dynamic content by default
+            if "application/json" in ct:
+                return min(max(json_ttl, 0), max_ttl)
+            return min(max(html_ttl, 0), max_ttl)
 
         return 0
 
 
 class ProxyServer:
+    _DEFAULT_QUOTA_BLOCKED_HOSTS = (
+        "google-analytics.com",
+        "googletagmanager.com",
+        "googletagservices.com",
+        "doubleclick.net",
+        "googlesyndication.com",
+        "googleadservices.com",
+        "facebook.net",
+        "hotjar.com",
+        "sentry.io",
+    )
+
     def __init__(self, config: dict):
         self.host = config.get("listen_host", "127.0.0.1")
         self.port = config.get("listen_port", 8080)
@@ -117,6 +149,46 @@ class ProxyServer:
         # hosts override — DNS fake-map: domain/suffix → IP
         # Checked before any real DNS lookup; supports exact and suffix matching.
         self._hosts: dict[str, str] = config.get("hosts", {})
+        custom_sni_suffixes = config.get("sni_rewrite_suffixes")
+        if isinstance(custom_sni_suffixes, list):
+            self._sni_rewrite_suffixes = tuple(
+                str(s).lower().strip().lstrip(".")
+                for s in custom_sni_suffixes
+                if str(s).strip()
+            )
+        else:
+            self._sni_rewrite_suffixes = self._SNI_REWRITE_SUFFIXES
+
+        # Quota controls for apps_script mode.
+        self.low_quota_mode = bool(config.get("low_quota_mode", False))
+        self.disable_parallel_downloads = bool(
+            config.get("disable_parallel_downloads", self.low_quota_mode)
+        )
+        blocked = config.get("blocked_hosts")
+        if blocked is None and self.low_quota_mode:
+            blocked = list(self._DEFAULT_QUOTA_BLOCKED_HOSTS)
+        self._blocked_hosts: set[str] = {
+            str(h).lower().strip().lstrip(".")
+            for h in (blocked or [])
+            if str(h).strip()
+        }
+        allowed = config.get("allowed_hosts")
+        self._allowed_hosts: set[str] = {
+            str(h).lower().strip().lstrip(".")
+            for h in (allowed or [])
+            if str(h).strip()
+        }
+        self._cache_html_ttl = int(config.get(
+            "cache_html_ttl", 30 if self.low_quota_mode else 0
+        ))
+        self._cache_json_ttl = int(config.get(
+            "cache_json_ttl", 15 if self.low_quota_mode else 0
+        ))
+        self._cache_static_min_ttl = int(config.get(
+            "cache_static_min_ttl", 3600 if self.low_quota_mode else 0
+        ))
+        self._cache_max_ttl = int(config.get("cache_max_ttl", 86400))
+        self.quiet_logs = bool(config.get("quiet_logs", True))
 
         if self.mode == "apps_script":
             try:
@@ -126,6 +198,21 @@ class ProxyServer:
                 log.error("apps_script mode requires 'cryptography' package.")
                 log.error("Run: pip install cryptography")
                 raise SystemExit(1)
+            if self.low_quota_mode:
+                log.info(
+                    "Low quota mode active: blocked_hosts=%d, parallel_downloads=%s",
+                    len(self._blocked_hosts),
+                    "off" if self.disable_parallel_downloads else "on",
+                )
+            if self._allowed_hosts:
+                log.info("Allowed-host mode active: allowed_hosts=%d", len(self._allowed_hosts))
+
+    def _log_traffic(self, message: str, *args):
+        """Reduce noisy per-request logs when quiet_logs is enabled."""
+        if self.quiet_logs:
+            log.debug(message, *args)
+        else:
+            log.info(message, *args)
 
     async def start(self):
         srv = await asyncio.start_server(self._on_client, self.host, self.port)
@@ -184,7 +271,19 @@ class ProxyServer:
         if not host:
             host, port = target, 443
 
-        log.info("CONNECT → %s:%d", host, port)
+        if self.mode == "apps_script":
+            if not self._is_allowed_host(host):
+                self._log_traffic("CONNECT blocked (allowlist) → %s:%d", host, port)
+                writer.write(self._not_allowed_response(host))
+                await writer.drain()
+                return
+            if self._is_blocked_host(host):
+                self._log_traffic("CONNECT blocked (quota) → %s:%d", host, port)
+                writer.write(self._blocked_response(host))
+                await writer.drain()
+                return
+
+        self._log_traffic("CONNECT → %s:%d", host, port)
 
         writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await writer.drain()
@@ -195,12 +294,19 @@ class ProxyServer:
                 # SNI-blocked domain: MITM-decrypt from browser, then
                 # re-connect to the override IP with SNI=front_domain so
                 # the ISP never sees the blocked hostname in the TLS handshake.
-                log.info("SNI-rewrite tunnel → %s via %s (SNI: %s)",
-                         host, override_ip, self.fronter.sni_host)
-                await self._do_sni_rewrite_tunnel(host, port, reader, writer,
-                                                  connect_ip=override_ip)
+                self._log_traffic("SNI-rewrite tunnel → %s via %s (SNI: %s)",
+                                  host, override_ip, self.fronter.sni_host)
+                ok = await self._do_sni_rewrite_tunnel(
+                    host, port, reader, writer, connect_ip=override_ip
+                )
+                if not ok:
+                    # Keep playback alive when rewrite path is flaky on some ISPs.
+                    self._log_traffic(
+                        "SNI-rewrite failed, fallback to MITM relay → %s:%d", host, port
+                    )
+                    await self._do_mitm_connect(host, port, reader, writer)
             elif self._is_google_domain(host):
-                log.info("Direct tunnel → %s (Google domain, skipping relay)", host)
+                self._log_traffic("Direct tunnel → %s (Google domain, skipping relay)", host)
                 await self._do_direct_tunnel(host, port, reader, writer)
             else:
                 await self._do_mitm_connect(host, port, reader, writer)
@@ -241,7 +347,7 @@ class ProxyServer:
         if ip:
             return ip
         h = host.lower().rstrip(".")
-        for suffix in self._SNI_REWRITE_SUFFIXES:
+        for suffix in self._sni_rewrite_suffixes:
             if h == suffix or h.endswith("." + suffix):
                 return self.fronter.connect_host  # configured google_ip
         return None
@@ -262,6 +368,82 @@ class ProxyServer:
             if parent in self._hosts:
                 return self._hosts[parent]
         return None
+
+    def _is_blocked_host(self, host: str) -> bool:
+        h = host.lower().rstrip(".")
+        if h in self._blocked_hosts:
+            return True
+        for blocked in self._blocked_hosts:
+            if h.endswith("." + blocked):
+                return True
+        return False
+
+    def _is_allowed_host(self, host: str) -> bool:
+        """Return True when host is allowed by the optional whitelist."""
+        if not self._allowed_hosts:
+            return True
+        h = host.lower().rstrip(".")
+        if h in self._allowed_hosts:
+            return True
+        for allowed in self._allowed_hosts:
+            if h.endswith("." + allowed):
+                return True
+        return False
+
+    @staticmethod
+    def _blocked_response(host: str) -> bytes:
+        body = f"Blocked by low_quota_mode: {host}".encode()
+        return (
+            b"HTTP/1.1 403 Forbidden\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"\r\n" + body
+        )
+
+    @staticmethod
+    def _not_allowed_response(host: str) -> bytes:
+        body = f"Blocked by allowed_hosts policy: {host}".encode()
+        return (
+            b"HTTP/1.1 403 Forbidden\r\n"
+            b"Content-Type: text/plain\r\n"
+            b"Content-Length: " + str(len(body)).encode() + b"\r\n"
+            b"\r\n" + body
+        )
+
+    @staticmethod
+    def _empty_204_response() -> bytes:
+        return (
+            b"HTTP/1.1 204 No Content\r\n"
+            b"Content-Length: 0\r\n"
+            b"Cache-Control: no-store\r\n"
+            b"Connection: keep-alive\r\n"
+            b"\r\n"
+        )
+
+    @staticmethod
+    def _should_drop_local_quota_request(host: str, path: str) -> bool:
+        """Drop noisy telemetry calls locally to save Apps Script quota.
+
+        These endpoints are high-frequency stats/logging requests used for
+        analytics/QoE tracking and are not required for core playback.
+        """
+        h = (host or "").lower().rstrip(".")
+        p = (path or "").lower()
+        telemetry_hosts = (
+            "youtube.com",
+            "s.youtube.com",
+            "youtubei.googleapis.com",
+        )
+        if not any(h == x or h.endswith("." + x) for x in telemetry_hosts):
+            return False
+        telemetry_path_markers = (
+            "/api/stats/",
+            "/ptracking",
+            "/youtubei/v1/log_event",
+            "/youtubei/v1/att/",
+            "/youtubei/v1/stats/",
+        )
+        return any(marker in p for marker in telemetry_path_markers)
 
     # ── Google domain detection ───────────────────────────────────
 
@@ -335,7 +517,7 @@ class ProxyServer:
     # ── SNI-rewrite tunnel ────────────────────────────────────────
 
     async def _do_sni_rewrite_tunnel(self, host: str, port: int, reader, writer,
-                                     connect_ip: str | None = None):
+                                     connect_ip: str | None = None) -> bool:
         """MITM-decrypt TLS from browser, then re-encrypt toward connect_ip
         using SNI=front_domain (e.g. www.google.com).
 
@@ -345,21 +527,8 @@ class ProxyServer:
         target_ip = connect_ip or self.fronter.connect_host
         sni_out   = self.fronter.sni_host  # e.g. "www.google.com"
 
-        # Step 1: MITM — accept TLS from the browser
-        ssl_ctx_server = self.mitm.get_server_context(host)
-        loop = asyncio.get_event_loop()
-        transport = writer.transport
-        protocol  = transport.get_protocol()
-        try:
-            new_transport = await loop.start_tls(
-                transport, protocol, ssl_ctx_server, server_side=True,
-            )
-        except Exception as e:
-            log.debug("SNI-rewrite TLS accept failed (%s): %s", host, e)
-            return
-        writer._transport = new_transport
-
-        # Step 2: open outgoing TLS to target IP with the safe SNI
+        # Step 1: open outgoing TLS to target IP with the safe SNI first.
+        # If this fails, we can still cleanly fallback to normal MITM relay.
         ssl_ctx_client = ssl.create_default_context()
         if not self.fronter.verify_ssl:
             ssl_ctx_client.check_hostname = False
@@ -376,9 +545,27 @@ class ProxyServer:
         except Exception as e:
             log.error("SNI-rewrite outbound connect failed (%s via %s): %s",
                       host, target_ip, e)
-            return
+            return False
 
-        # Step 3: pipe application-layer bytes between the two TLS sessions
+        # Step 2: MITM — accept TLS from the browser.
+        ssl_ctx_server = self.mitm.get_server_context(host)
+        loop = asyncio.get_event_loop()
+        transport = writer.transport
+        protocol = transport.get_protocol()
+        try:
+            new_transport = await loop.start_tls(
+                transport, protocol, ssl_ctx_server, server_side=True,
+            )
+        except Exception as e:
+            log.debug("SNI-rewrite TLS accept failed (%s): %s", host, e)
+            try:
+                w_out.close()
+            except Exception:
+                pass
+            return False
+        writer._transport = new_transport
+
+        # Step 3: pipe application-layer bytes between the two TLS sessions.
         async def pipe(src, dst, label):
             try:
                 while True:
@@ -401,11 +588,23 @@ class ProxyServer:
             pipe(reader, w_out, f"client→{host}"),
             pipe(r_out,  writer, f"{host}→client"),
         )
+        return True
 
     # ── MITM CONNECT (apps_script mode) ───────────────────────────
 
     async def _do_mitm_connect(self, host: str, port: int, reader, writer):
         """Intercept TLS, decrypt HTTP, and relay through Apps Script."""
+        if not self._is_allowed_host(host):
+            log.debug("Blocked host (allowlist): %s", host)
+            writer.write(self._not_allowed_response(host))
+            await writer.drain()
+            return
+        if self._is_blocked_host(host):
+            log.debug("Blocked host (quota): %s", host)
+            writer.write(self._blocked_response(host))
+            await writer.drain()
+            return
+
         ssl_ctx = self.mitm.get_server_context(host)
 
         # Upgrade the existing connection to TLS (we are the server)
@@ -474,7 +673,13 @@ class ProxyServer:
                 else:
                     url = f"https://{host}:{port}{path}"
 
-                log.info("MITM → %s %s", method, url)
+                self._log_traffic("MITM → %s %s", method, url)
+
+                if self._should_drop_local_quota_request(host, path):
+                    self._log_traffic("Dropped telemetry (quota-save) → %s", url[:80])
+                    writer.write(self._empty_204_response())
+                    await writer.drain()
+                    continue
 
                 # ── CORS: extract relevant request headers ────────────────────
                 origin = next(
@@ -520,7 +725,14 @@ class ProxyServer:
 
                     # Cache successful GET responses
                     if method == "GET" and not body and response:
-                        ttl = ResponseCache.parse_ttl(response, url)
+                        ttl = ResponseCache.parse_ttl(
+                            response,
+                            url,
+                            html_ttl=self._cache_html_ttl,
+                            json_ttl=self._cache_json_ttl,
+                            static_min_ttl=self._cache_static_min_ttl,
+                            max_ttl=self._cache_max_ttl,
+                        )
                         if ttl > 0:
                             self._cache.put(url, response, ttl)
                             log.debug("Cached (%ds): %s", ttl, url[:60])
@@ -621,6 +833,8 @@ class ProxyServer:
                         )
             # Only probe with Range when the URL looks like a big file.
             if self._is_likely_download(url, headers):
+                if self.disable_parallel_downloads:
+                    return await self.fronter.relay(method, url, headers, body)
                 return await self.fronter.relay_parallel(
                     method, url, headers, body
                 )
@@ -655,7 +869,7 @@ class ProxyServer:
                 break
 
         first_line = header_block.split(b"\r\n")[0].decode(errors="replace")
-        log.info("HTTP → %s", first_line)
+        self._log_traffic("HTTP → %s", first_line)
 
         if self.mode == "apps_script":
             # Parse request and relay through Apps Script
@@ -663,11 +877,55 @@ class ProxyServer:
             method = parts[0] if parts else "GET"
             url = parts[1] if len(parts) > 1 else "/"
 
+            if method.upper() == "GET" and self._is_local_quota_path(url):
+                response = await self._handle_quota_status()
+                writer.write(response)
+                await writer.drain()
+                return
+
+            host = ""
+            try:
+                host = (urlparse(url).hostname or "").lower()
+            except Exception:
+                host = ""
+
             headers = {}
             for raw_line in header_block.split(b"\r\n")[1:]:
                 if b":" in raw_line:
                     k, v = raw_line.decode(errors="replace").split(":", 1)
                     headers[k.strip()] = v.strip()
+            if not host:
+                host_header = next(
+                    (v for k, v in headers.items() if k.lower() == "host"),
+                    "",
+                )
+                host = host_header.split(":", 1)[0].lower()
+
+            req_path = ""
+            try:
+                parsed_req = urlparse(url)
+                req_path = parsed_req.path or "/"
+            except Exception:
+                req_path = "/"
+
+            if self._should_drop_local_quota_request(host, req_path):
+                self._log_traffic("Dropped telemetry (quota-save) → %s", url[:80])
+                writer.write(self._empty_204_response())
+                await writer.drain()
+                return
+
+            if host and self._is_blocked_host(host):
+                log.debug("Blocked host (quota): %s", host)
+                response = self._blocked_response(host)
+                writer.write(response)
+                await writer.drain()
+                return
+            if host and not self._is_allowed_host(host):
+                log.debug("Blocked host (allowlist): %s", host)
+                response = self._not_allowed_response(host)
+                writer.write(response)
+                await writer.drain()
+                return
 
             # ── CORS preflight over plain HTTP ────────────────────────────
             origin = next(
@@ -698,7 +956,14 @@ class ProxyServer:
                 response = await self._relay_smart(method, url, headers, body)
                 # Cache successful GET
                 if method == "GET" and not body and response:
-                    ttl = ResponseCache.parse_ttl(response, url)
+                    ttl = ResponseCache.parse_ttl(
+                        response,
+                        url,
+                        html_ttl=self._cache_html_ttl,
+                        json_ttl=self._cache_json_ttl,
+                        static_min_ttl=self._cache_static_min_ttl,
+                        max_ttl=self._cache_max_ttl,
+                    )
                     if ttl > 0:
                         self._cache.put(url, response, ttl)
 
@@ -713,6 +978,36 @@ class ProxyServer:
 
         writer.write(response)
         await writer.drain()
+
+    @staticmethod
+    def _is_local_quota_path(url: str) -> bool:
+        parsed = urlparse(url)
+        path = parsed.path or url
+        return path == "/__quota"
+
+    async def _handle_quota_status(self) -> bytes:
+        """Serve live Apps Script quota JSON on a local proxy endpoint."""
+        try:
+            payload = await self.fronter.fetch_quota_status()
+            status = 200
+        except Exception as exc:
+            log.error("Quota status fetch failed: %s", exc)
+            payload = {
+                "ok": False,
+                "error": str(exc),
+            }
+            status = 502
+
+        body = json.dumps(payload, indent=2, sort_keys=True).encode() + b"\n"
+        reason = "OK" if status == 200 else "Bad Gateway"
+        return (
+            f"HTTP/1.1 {status} {reason}\r\n"
+            f"Content-Type: application/json; charset=utf-8\r\n"
+            f"Content-Length: {len(body)}\r\n"
+            f"Cache-Control: no-store\r\n"
+            f"Connection: close\r\n"
+            f"\r\n"
+        ).encode() + body
 
     async def _tunnel_http(self, header_block: bytes, body: bytes) -> bytes:
         """Forward plain HTTP via a persistent WebSocket tunnel.

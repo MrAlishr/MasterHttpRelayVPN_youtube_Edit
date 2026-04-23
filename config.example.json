@@ -7,8 +7,41 @@
 	"auth_key": "CHANGE_ME_TO_A_STRONG_SECRET",
 	"listen_host": "127.0.0.1",
 	"listen_port": 8085,
-	"log_level": "INFO",
+	"log_level": "WARNING",
+	"quiet_logs": true,
 	"verify_ssl": true,
+	"_quota_comment": "Enable low_quota_mode to reduce Apps Script UrlFetch calls. Official Apps Script URL Fetch quotas are commonly 20,000/day for consumer accounts and 100,000/day for Google Workspace accounts; this mode helps stretch that budget by blocking tracker domains, dropping selected YouTube telemetry locally, disabling parallel range fanout by default, and allowing short caching of HTML/JSON/static responses.",
+	"low_quota_mode": true,
+	"disable_parallel_downloads": true,
+	"cache_html_ttl": 30,
+	"cache_json_ttl": 15,
+	"cache_static_min_ttl": 3600,
+	"cache_max_ttl": 86400,
+	"_allowed_hosts_comment": "Optional allowlist. When set, ONLY these domains (and subdomains) are reachable via proxy. Good for YouTube-only use.",
+	"allowed_hosts": [
+		"youtube.com",
+		"youtu.be",
+		"googlevideo.com",
+		"ytimg.com",
+		"ggpht.com",
+		"youtubei.googleapis.com"
+	],
+	"blocked_hosts": [
+		"google-analytics.com",
+		"googletagmanager.com",
+		"googletagservices.com",
+		"doubleclick.net",
+		"googlesyndication.com",
+		"googleadservices.com",
+		"facebook.net",
+		"hotjar.com",
+		"sentry.io"
+	],
 	"_hosts_comment": "Optional SNI-rewrite overrides. YouTube, googlevideo, gstatic, fonts.googleapis.com, ytimg, ggpht, doubleclick, etc. are ALREADY handled automatically (routed via google_ip with SNI=front_domain, same trick as the Xray MITM-DomainFronting config). Add entries here only for custom domains, e.g. \"example.com\": \"216.239.38.120\".",
 	"hosts": {}
+	,
+	"_sni_rewrite_suffixes_comment": "Optional override for built-in SNI rewrite suffixes. Use this to keep rewrite only for domains that reduce quota without causing stale/restricted behavior.",
+	"sni_rewrite_suffixes": [
+		"googlevideo.com"
+	]
 }
