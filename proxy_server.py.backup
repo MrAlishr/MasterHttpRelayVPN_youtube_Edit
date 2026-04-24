@@ -25,7 +25,7 @@ log = logging.getLogger("Proxy")
 class ResponseCache:
     """Simple LRU response cache — avoids repeated relay calls."""
 
-    def __init__(self, max_mb: int = 200):
+    def __init__(self, max_mb: int = 50):
         self._store: dict[str, tuple[bytes, float]] = {}
         self._size = 0
         self._max = max_mb * 1024 * 1024
@@ -93,10 +93,6 @@ class ResponseCache:
             ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
             ".mp3", ".mp4", ".wasm",
         )
-        # Video segments get longer cache (they never change)
-        if "googlevideo.com" in url.lower() and ("videoplayback" in url.lower() or "mime=video" in url.lower()):
-            return min(7200, max_ttl)  # 2 hours for video segments
-        
         for ext in static_exts:
             if path.endswith(ext):
                 ttl = 3600  # 1 hour default for static assets
@@ -446,12 +442,6 @@ class ProxyServer:
             "/youtubei/v1/log_event",
             "/youtubei/v1/att/",
             "/youtubei/v1/stats/",
-            "/youtubei/v1/player/heartbeat",
-            "/api/stats/qoe",
-            "/api/stats/watchtime",
-            "/api/stats/ads",
-            "/generate_204",
-            "/pagead/",
         )
         return any(marker in p for marker in telemetry_path_markers)
 
