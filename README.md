@@ -8,6 +8,19 @@ A free tool that lets you access the internet freely by hiding your traffic behi
 
 > **How it works in simple terms:** Your browser talks to this tool on your computer. This tool disguises your traffic to look like normal Google traffic. The firewall/filter sees "google.com" and lets it pass. Behind the scenes, a free Google Apps Script relay fetches the real website for you.
 
+## Fork Notes
+
+This repository is a community-maintained fork by [@MrAlishr](https://github.com/MrAlishr), based on the original
+[masterking32/MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN/tree/main).
+
+Compared with the original base, this fork currently focuses on the newer Python-testing work, including:
+
+- better `apps_script` mode documentation
+- MITM certificate trust checks and install helpers
+- `script_id` / `script_ids` round-robin support
+- lower-quota defaults and quota-aware guidance
+- refreshed English and Persian setup guides
+
 ---
 
 ## Announcement and Support Channel 📢
@@ -344,7 +357,12 @@ MasterHttpRelayVPN is provided for educational, testing, and research purposes o
 
 ## Special Thanks
 
-Special thanks to [@abolix](https://github.com/abolix) for making this project possible.
+Special thanks to:
+
+- [@masterking32](https://github.com/masterking32) for the original
+  [MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN/tree/main) base project
+- [@MrAlishr](https://github.com/MrAlishr) for maintaining this fork and documenting the newer Python-testing changes
+- [@abolix](https://github.com/abolix) for making this project possible
 
 ## License
 
